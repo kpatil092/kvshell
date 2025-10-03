@@ -4,6 +4,7 @@
 #include <string.h>
 #include <signal.h>
 #include <errno.h>
+#include <pthread.h>
 
 #include <sys/types.h>
 #include <sys/socket.h>
@@ -14,6 +15,7 @@
 
 #define MAX_LEN 256
 #define BUFFER_SIZE 256
+#define MAX_CLIENT 10
 
 typedef struct kv_node {
   int key;
@@ -21,9 +23,17 @@ typedef struct kv_node {
   char *value;
 } kv_node_t;
 
+typedef struct client_arg {
+  int confd;
+  struct sockaddr_in cliaddr;
+  int slot;
+} client_arg_t;
+
 int kv_idx = 0;
+static pthread_mutex_t kv_mutex = PTHREAD_MUTEX_INITIALIZER;
 
 static kv_node_t *kv_table[MAX_LEN];
+int thread_occ[MAX_CLIENT];
 
 ssize_t read_n(int fd, void *vptr, size_t n) {
   size_t nleft = n;
@@ -73,7 +83,7 @@ static int send_response(int confd, char status, const void *payload, int payloa
 
 static int kv_find(int key) {
   for(int i=0; i<kv_idx; i++) {
-    if(kv_table[i]->key == key) return i;
+    if(kv_table[i] && kv_table[i]->key == key) return i;
   }
   return -1;
 }
@@ -81,11 +91,15 @@ static int kv_find(int key) {
 static int kv_create(int key, int vlen, const char *value) {
   if (kv_find(key) != -1) return -1; 
   if(kv_idx == MAX_LEN) return -3;
+
   kv_node_t *node = malloc(sizeof(kv_node_t));
   if (!node) return -2;
   node->key = key;
   node->value = malloc(vlen);
-  if (!node->value) { free(node); return -2; }
+  if (!node->value) { 
+    free(node); 
+    return -2; 
+  }
   memcpy(node->value, value, vlen);
   node->vlen = vlen;
 
@@ -96,6 +110,7 @@ static int kv_create(int key, int vlen, const char *value) {
 static int kv_update(int key, int vlen, const char *value) {
   int idx = kv_find(key);
   if (idx == -1) return -1;
+
   kv_node_t *node = kv_table[idx];
   char *newv = malloc(vlen);
   if (!newv) return -2;
@@ -118,6 +133,157 @@ static int kv_delete(int key) {
   }
   kv_table[--kv_idx] = NULL;
   return 0;
+}
+
+static void *client_thread(void *arg) {
+  client_arg_t *carg = (client_arg_t *)arg;
+  int confd = carg->confd;
+  int slot = carg->slot;
+
+  char clie_ip[INET_ADDRSTRLEN];
+  inet_ntop(AF_INET, &carg->cliaddr.sin_addr, clie_ip, sizeof(clie_ip));
+  printf("Client connected from %s:%d\n", clie_ip, ntohs(carg->cliaddr.sin_port));
+
+  while(1) {
+    unsigned char header[9];
+    ssize_t r = read_n(confd, header, 9);
+    if (r == 0) { /* client closed */
+      printf("Client disconnected from %s:%d (slot %d)\n", clie_ip, ntohs(carg->cliaddr.sin_port), slot);
+      close(confd);
+      break;
+    } else if (r < 0) {
+      perror("read header");
+      close(confd);
+      break;
+    } else if (r != 9) {
+      fprintf(stderr, "Incomplete header read (%zd bytes). Closing (slot %d).\n", r, slot);
+      close(confd);
+      break;
+    } 
+    
+    char op = (char)header[0];
+    int32_t key_n, vlen_n;
+    memcpy(&key_n, &header[1], 4);
+    memcpy(&vlen_n, &header[5], 4);
+    int key = ntohl(key_n);
+    int vlen = ntohl(vlen_n);
+    if(vlen < 0) {
+      const char *err = "Invalid value size";
+      send_response(confd, 'E', err, (int)strlen(err));
+      // read_n(confd, malloc(1), (size_t)(-vlen));
+      continue;
+    }
+
+    char *value = NULL;
+    if((op == 'C' || op == 'U') && vlen > 0) {
+      value = malloc(vlen);
+      if (!value) {
+        const char *err = "Server out of memory";
+        send_response(confd, 'E', err, (int)strlen(err));
+        char discard_buf[1];
+        read_n(confd, discard_buf, (size_t)vlen);
+        continue;
+      }
+
+      ssize_t n = read_n(confd, value, (size_t)vlen);
+      if (n != vlen) {
+          free(value);
+          const char *err = "Failed to read value bytes (client disconnect?)";
+          send_response(confd, 'E', err, (int)strlen(err));
+          close(confd);
+          break;
+      }
+    }
+
+    if(op == 'C') {
+      pthread_mutex_lock(&kv_mutex);
+      int res_c = kv_create(key, vlen, value);
+      pthread_mutex_unlock(&kv_mutex);
+
+      if(value) free(value);
+      if(res_c == 0) {
+        const char *ok = "OK";
+        send_response(confd, 'O', ok, 2);
+      } else if (res_c == -1) {
+        const char *err = "Key already exists";
+        send_response(confd, 'E', err, (int)strlen(err));
+      } else if(res_c == -2) {
+        const char *err = "Create failed (server error)";
+        send_response(confd, 'E', err, (int)strlen(err));
+      } else {
+        const char *err = "Create failed (table size reached)";
+        send_response(confd, 'E', err, (int)strlen(err));
+      }
+
+    } else if(op == 'R') {
+      char *outbuf = NULL;
+      int outlen = 0;
+      pthread_mutex_lock(&kv_mutex);
+      int idx = kv_find(key);
+      if (idx == -1) {
+        pthread_mutex_unlock(&kv_mutex);
+        const char *err = "Key not found";
+        send_response(confd, 'E', err, (int)strlen(err));
+      } else {
+        kv_node_t *node = kv_table[idx];
+        if (node->vlen > 0) {
+          outlen = node->vlen;
+          outbuf = malloc((size_t)outlen);
+          if (outbuf) memcpy(outbuf, node->value, (size_t)outlen);
+        } else {
+          outlen = 0;
+        }
+        pthread_mutex_unlock(&kv_mutex);
+
+        if (outlen > 0 && !outbuf) {
+          const char *err = "Server out of memory";
+          send_response(confd, 'E', err, (int)strlen(err));
+        } else {
+          send_response(confd, 'O', outbuf, outlen);
+        }
+        if (outbuf) free(outbuf);
+      }
+      
+    } else if(op == 'U') {
+      pthread_mutex_lock(&kv_mutex);
+      int res_u = kv_update(key, vlen, value);
+      pthread_mutex_unlock(&kv_mutex);
+
+      if (value) free(value);
+      if (res_u == 0) {
+        const char *ok = "OK";
+        send_response(confd, 'O', ok, 2);
+      } else if (res_u == -1) {
+        const char *err = "Key does not exist";
+        send_response(confd, 'E', err, (int)strlen(err));
+      } else {
+        const char *err = "Update failed (server error)";
+        send_response(confd, 'E', err, (int)strlen(err));
+      }
+
+    } else if(op == 'D') {
+      pthread_mutex_lock(&kv_mutex);
+      int res_d = kv_delete(key);
+      pthread_mutex_unlock(&kv_mutex);
+
+      if (res_d == 0) {
+        const char *ok = "OK";
+        send_response(confd, 'O', ok, 2);
+      } else {
+        const char *err = "Key does not exist";
+        send_response(confd, 'E', err, (int)strlen(err));
+      }
+
+    } else {
+      const char *err = "Unknown operation";
+      send_response(confd, 'E', err, (int)strlen(err));
+      if (value) free(value);
+    }
+  }
+
+  thread_occ[slot] = 0;
+  free(carg);
+  return NULL;
 }
 
 int main(int argc, char *argv[]) {
@@ -173,6 +339,7 @@ int main(int argc, char *argv[]) {
   printf("KV server listening on %s:%d\n", bind_ip, port);
 
   memset(kv_table, 0, sizeof(kv_table));
+  memset(thread_occ, 0, sizeof(thread_occ));
 
   while(1) {
     struct sockaddr_in cliaddr;
@@ -184,115 +351,50 @@ int main(int argc, char *argv[]) {
       continue;
     }
 
-    char clie_ip[INET_ADDRSTRLEN];
-    inet_ntop(AF_INET, &cliaddr.sin_addr, clie_ip, sizeof(clie_ip));
-    printf("Client connected from %s:%d\n", clie_ip, ntohs(cliaddr.sin_port));
-
-    while(1) {
-      unsigned char header[9];
-      ssize_t r = read_n(confd, header, 9);
-      if (r == 0) { /* client closed */
-        printf("Client disconnected\n");
-        close(confd);
+    int slot = -1;
+    for(int i=0; i<MAX_CLIENT; i++) {
+      if(!thread_occ[i]) {
+        slot = i;
         break;
-      } else if (r < 0) {
-        perror("read header");
-        close(confd);
-        break;
-      } else if (r != 9) {
-        fprintf(stderr, "Incomplete header read (%zd bytes). Closing.\n", r);
-        close(confd);
-        break;
-      } 
-      
-      char op = (char)header[0];
-      int32_t key_n, vlen_n;
-      memcpy(&key_n, &header[1], 4);
-      memcpy(&vlen_n, &header[5], 4);
-      int key = ntohl(key_n);
-      int vlen = ntohl(vlen_n);
-      if(vlen < 0) {
-        const char *err = "Invalid value size";
-        send_response(confd, 'E', err, (int)strlen(err));
-        // readn(confd, malloc(1), (size_t)(-vlen));
-        continue;
-      }
-
-      char *value = NULL;
-      if((op == 'C' || op == 'U') && vlen > 0) {
-        value = malloc(vlen);
-        if (!value) {
-          const char *err = "Server out of memory";
-          send_response(confd, 'E', err, (int)strlen(err));
-          char discard_buf[1];
-          read_n(confd, discard_buf, (size_t)vlen);
-          continue;
-        }
-
-        ssize_t n = read_n(confd, value, (size_t)vlen);
-        if (n != vlen) {
-            free(value);
-            const char *err = "Failed to read value bytes (client disconnect?)";
-            send_response(confd, 'E', err, (int)strlen(err));
-            close(confd);
-            break;
-        }
-      }
-
-      if(op == 'C') {
-        int res_c = kv_create(key, vlen, value);
-        if(value) free(value);
-        if(res_c == 0) {
-          const char *ok = "OK";
-          send_response(confd, 'O', ok, 2);
-        } else if (res_c == -1) {
-          const char *err = "Key already exists";
-          send_response(confd, 'E', err, (int)strlen(err));
-        } else if(res_c == -2) {
-          const char *err = "Create failed (server error)";
-          send_response(confd, 'E', err, (int)strlen(err));
-        } else {
-          const char *err = "Create failed (table size reached)";
-          send_response(confd, 'E', err, (int)strlen(err));
-        }
-      } else if(op == 'R') {
-        int idx = kv_find(key);
-        if (idx == -1) {
-            const char *err = "Key not found";
-            send_response(confd, 'E', err, (int)strlen(err));
-        } else {
-          kv_node_t *node = kv_table[idx];
-          send_response(confd, 'O', node->value, node->vlen);
-        }
-        
-      } else if(op == 'U') {
-        int res_u = kv_update(key, vlen, value);
-        if (value) free(value);
-        if (res_u == 0) {
-          const char *ok = "OK";
-          send_response(confd, 'O', ok, 2);
-        } else if (res_u == -1) {
-          const char *err = "Key does not exist";
-          send_response(confd, 'E', err, (int)strlen(err));
-        } else {
-          const char *err = "Update failed (server error)";
-          send_response(confd, 'E', err, (int)strlen(err));
-        }
-      } else if(op == 'D') {
-        int res_d = kv_delete(key);
-        if (res_d == 0) {
-          const char *ok = "OK";
-          send_response(confd, 'O', ok, 2);
-        } else {
-          const char *err = "Key does not exist";
-          send_response(confd, 'E', err, (int)strlen(err));
-        }
-      } else {
-        const char *err = "Unknown operation";
-        send_response(confd, 'E', err, (int)strlen(err));
-        if (value) free(value);
       }
     }
+
+    if (slot == -1) {
+      const char *msg = "Server busy: too many clients";
+      send_response(confd, 'E', msg, (int)strlen(msg));
+      close(confd);
+      continue;
+    }
+
+    thread_occ[slot] = 1;
+
+    client_arg_t *carg = malloc(sizeof(client_arg_t));
+    if (!carg) {
+      const char *msg = "Server error: cannot allocate client state";
+      send_response(confd, 'E', msg, (int)strlen(msg));
+      close(confd);
+      thread_occ[slot] = 0;
+      continue;
+    }
+    carg->confd = confd;
+    carg->cliaddr = cliaddr;
+    carg->slot = slot;
+
+    pthread_t tid;
+    pthread_attr_t attr;
+    pthread_attr_init(&attr);
+    pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED);
+    int rc = pthread_create(&tid, &attr, client_thread, carg);
+    if (rc != 0) {
+      perror("pthread_create");
+      const char *msg = "Server error: cannot spawn client thread";
+      send_response(confd, 'E', msg, (int)strlen(msg));
+      close(confd);
+      free(carg);
+      thread_occ[slot] = 0;
+      continue;
+    }
+
   }
 
   close(fd);
