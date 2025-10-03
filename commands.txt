@@ -1,0 +1,4 @@
+connect 127.0.0.1 12345
+create 42 11 hello world
+read 42
+disconnect
