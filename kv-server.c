@@ -24,12 +24,6 @@ typedef struct kv_node {
   char *value;
 } kv_node_t;
 
-typedef struct client_arg {
-  int confd;
-  struct sockaddr_in cliaddr;
-  int slot;
-} client_arg_t;
-
 int kv_idx = 0;
 int front = 0, rear = 0, count = 0;
 static pthread_mutex_t kv_mutex = PTHREAD_MUTEX_INITIALIZER;
@@ -344,16 +338,16 @@ int main(int argc, char *argv[]) {
     exit(EXIT_FAILURE);
   }
 
-  int fd = socket(AF_INET, SOCK_STREAM, 0);
-  if (fd < 0)   {
+  int listen_fd = socket(AF_INET, SOCK_STREAM, 0);
+  if (listen_fd < 0)   {
     perror("socket");
     exit(EXIT_FAILURE);
   }
 
   int yes = 1;
-  if (setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &yes, sizeof(yes)) < 0)   {
+  if (setsockopt(listen_fd, SOL_SOCKET, SO_REUSEADDR, &yes, sizeof(yes)) < 0)   {
     perror("setsockopt");
-    close(fd);
+    close(listen_fd);
     exit(EXIT_FAILURE);
   }
 
@@ -363,19 +357,19 @@ int main(int argc, char *argv[]) {
   servaddr.sin_port = htons((uint16_t)port);
   if(inet_pton(AF_INET, bind_ip, &servaddr.sin_addr) != 1) {
     fprintf(stderr, "Invalid bind IP: %s\n", bind_ip);
-    close(fd);
+    close(listen_fd);
     exit(EXIT_FAILURE);
   }
 
-  if(bind(fd, (struct sockaddr *)&servaddr, sizeof(servaddr)) < 0) {
+  if(bind(listen_fd, (struct sockaddr *)&servaddr, sizeof(servaddr)) < 0) {
     perror("bind");
-    close(fd);
+    close(listen_fd);
     exit(EXIT_FAILURE);
   }
 
-  if(listen(fd, 5) < 0) {
+  if(listen(listen_fd, 5) < 0) {
     perror("listen");
-    close(fd);
+    close(listen_fd);
     exit(EXIT_FAILURE);
   }
 
@@ -391,7 +385,7 @@ int main(int argc, char *argv[]) {
   while(1) {
     struct sockaddr_in cliaddr;
     socklen_t clien = sizeof(cliaddr);
-    int confd = accept(fd, (struct sockaddr *)&cliaddr, &clien);
+    int confd = accept(listen_fd, (struct sockaddr *)&cliaddr, &clien);
     if (confd < 0) {
       if (errno == EINTR) continue;
       perror("accept");
@@ -403,6 +397,6 @@ int main(int argc, char *argv[]) {
     enqueue_client(confd);
   }
 
-  close(fd);
+  close(listen_fd);
   return 0;
 }

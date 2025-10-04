@@ -42,8 +42,8 @@ A fixed **5-byte header** followed by payload:
 ## Build Instructions
 Compile the server and client using `gcc`:
 ```bash
-gcc -o kv-server kv-server.c
-gcc -o kv-client kv-client.c
+gcc -std=c11 -O2 -Wall -pthread -o kv-server kv-server.c
+gcc -std=c11 -O2 -Wall -o kv-client kv-client.c
 ```
 
 ## Running the server
@@ -81,7 +81,7 @@ gcc -o kv-client kv-client.c
 - Memory dynamically allocated for values and freed on deletion
 - Server ignores SIGPIPE so broken pipes return errors instead of crashing
 - Client enforces active connection before running operations
-- Values may be multi-line in batch/interactive mode: if fewer bytes than <value-size> are provided on one line, the client reads additional input until the full value is collected
+- Values may be multi-line in batch/interactive mode: if fewer bytes than `<value-size>` are provided on one line, the client reads additional input until the full value is collected
 - No authentication, no concurrency — can be extended
 - Errors returned as ASCII strings for easier debugging
 
