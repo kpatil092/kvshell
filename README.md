@@ -1,6 +1,6 @@
 # Key-Value Storage System (C, Socket Programming)
 
-A simple **multi-threaded** client-server key-value store implemented in C using TCP sockets.  
+A **multi-threaded** client-server key-value store implemented in C using TCP sockets with worker thread pool.  
 The server maintains key-value pairs in memory, and the client provides both **interactive** and **batch** modes to manipulate stored data via a custom binary protocol.  
 
 ---
@@ -8,7 +8,7 @@ The server maintains key-value pairs in memory, and the client provides both **i
 ## Features
 - Supports **Create, Read, Update, Delete (CRUD)** operations
 - Keys are **integers**, values are **arbitrary-length byte strings**
-- Each client connection is handled by a dedicated thread
+- Incoming clients placed in a queue which is handled by worker thread
 - Custom binary protocol for reliable transmission over TCP
 - Client supports:
   - **Interactive mode**: run commands with a prompt
@@ -16,7 +16,6 @@ The server maintains key-value pairs in memory, and the client provides both **i
 - In-memory hash-table–based store with persistence across client sessions
 - Handles TCP packet-splitting via exact-length `read_n/write_n` helpers
 - Human-readable error responses
-- Single-client server (simple to extend for concurrency)
 
 ---
 
