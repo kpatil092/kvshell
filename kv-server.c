@@ -15,7 +15,8 @@
 
 #define MAX_LEN 256
 #define BUFFER_SIZE 256
-#define MAX_CLIENT 10
+#define MAX_QUEUE  10
+#define NUM_WORKERS 4
 
 typedef struct kv_node {
   int key;
@@ -30,10 +31,39 @@ typedef struct client_arg {
 } client_arg_t;
 
 int kv_idx = 0;
+int front = 0, rear = 0, count = 0;
 static pthread_mutex_t kv_mutex = PTHREAD_MUTEX_INITIALIZER;
+pthread_mutex_t q_mutex = PTHREAD_MUTEX_INITIALIZER;
+pthread_cond_t q_not_empty = PTHREAD_COND_INITIALIZER;
+pthread_cond_t q_not_full = PTHREAD_COND_INITIALIZER;
 
 static kv_node_t *kv_table[MAX_LEN];
-int thread_occ[MAX_CLIENT];
+int client_queue[MAX_QUEUE];
+
+void enqueue_client(int fd) {
+  pthread_mutex_lock(&q_mutex);
+  while (count == MAX_QUEUE) {
+    pthread_cond_wait(&q_not_full, &q_mutex);
+  }
+  client_queue[rear] = fd;
+  rear = (rear + 1) % MAX_QUEUE;
+  count++;
+  pthread_cond_signal(&q_not_empty);
+  pthread_mutex_unlock(&q_mutex);
+}
+
+int dequeue_client() {
+  pthread_mutex_lock(&q_mutex);
+  while (count == 0) {
+    pthread_cond_wait(&q_not_empty, &q_mutex);
+  }
+  int fd = client_queue[front];
+  front = (front + 1) % MAX_QUEUE;
+  count--;
+  pthread_cond_signal(&q_not_full);
+  pthread_mutex_unlock(&q_mutex);
+  return fd;
+}
 
 ssize_t read_n(int fd, void *vptr, size_t n) {
   size_t nleft = n;
@@ -135,20 +165,23 @@ static int kv_delete(int key) {
   return 0;
 }
 
-static void *client_thread(void *arg) {
-  client_arg_t *carg = (client_arg_t *)arg;
-  int confd = carg->confd;
-  int slot = carg->slot;
+static void *client_handler(void *arg) {
+  int confd = *(int *)arg;
+  free(arg);
+
+  struct sockaddr_in cliaddr;
+  socklen_t len = sizeof(cliaddr);
+  getpeername(confd, (struct sockaddr *)&cliaddr, &len);
 
   char clie_ip[INET_ADDRSTRLEN];
-  inet_ntop(AF_INET, &carg->cliaddr.sin_addr, clie_ip, sizeof(clie_ip));
-  printf("Client connected from %s:%d\n", clie_ip, ntohs(carg->cliaddr.sin_port));
+  inet_ntop(AF_INET, &cliaddr.sin_addr, clie_ip, sizeof(clie_ip));
+  printf("[Worker] Handling client %s:%d\n", clie_ip, ntohs(cliaddr.sin_port));
 
   while(1) {
     unsigned char header[9];
     ssize_t r = read_n(confd, header, 9);
-    if (r == 0) { /* client closed */
-      printf("Client disconnected from %s:%d (slot %d)\n", clie_ip, ntohs(carg->cliaddr.sin_port), slot);
+    if (r == 0) {
+      printf("Client disconnected from %s:%d\n", clie_ip, ntohs(cliaddr.sin_port));
       close(confd);
       break;
     } else if (r < 0) {
@@ -156,10 +189,10 @@ static void *client_thread(void *arg) {
       close(confd);
       break;
     } else if (r != 9) {
-      fprintf(stderr, "Incomplete header read (%zd bytes). Closing (slot %d).\n", r, slot);
+      fprintf(stderr, "Incomplete header read (%zd bytes). Closing.\n", r);
       close(confd);
       break;
-    } 
+    }
     
     char op = (char)header[0];
     int32_t key_n, vlen_n;
@@ -280,9 +313,19 @@ static void *client_thread(void *arg) {
       if (value) free(value);
     }
   }
+  return NULL;
+}
 
-  thread_occ[slot] = 0;
-  free(carg);
+void *worker_thread(void *arg) {
+  long tid = (long)arg;
+  printf("[Worker %ld] Started.\n", tid);
+  while (1) {
+    int confd = dequeue_client();  
+    int *fd_ptr = malloc(sizeof(int));
+    *fd_ptr = confd;
+    client_handler(fd_ptr);
+    printf("[Worker %ld] Finished serving client.\n", tid);
+  }
   return NULL;
 }
 
@@ -339,7 +382,11 @@ int main(int argc, char *argv[]) {
   printf("KV server listening on %s:%d\n", bind_ip, port);
 
   memset(kv_table, 0, sizeof(kv_table));
-  memset(thread_occ, 0, sizeof(thread_occ));
+
+  pthread_t workers[NUM_WORKERS];
+  for (long i = 0; i < NUM_WORKERS; i++) {
+    pthread_create(&workers[i], NULL, worker_thread, (void *)i);
+  }
 
   while(1) {
     struct sockaddr_in cliaddr;
@@ -351,50 +398,9 @@ int main(int argc, char *argv[]) {
       continue;
     }
 
-    int slot = -1;
-    for(int i=0; i<MAX_CLIENT; i++) {
-      if(!thread_occ[i]) {
-        slot = i;
-        break;
-      }
-    }
+    printf("[Main] Accepted client from %s:%d\n", inet_ntoa(cliaddr.sin_addr), ntohs(cliaddr.sin_port));
 
-    if (slot == -1) {
-      const char *msg = "Server busy: too many clients";
-      send_response(confd, 'E', msg, (int)strlen(msg));
-      close(confd);
-      continue;
-    }
-
-    thread_occ[slot] = 1;
-
-    client_arg_t *carg = malloc(sizeof(client_arg_t));
-    if (!carg) {
-      const char *msg = "Server error: cannot allocate client state";
-      send_response(confd, 'E', msg, (int)strlen(msg));
-      close(confd);
-      thread_occ[slot] = 0;
-      continue;
-    }
-    carg->confd = confd;
-    carg->cliaddr = cliaddr;
-    carg->slot = slot;
-
-    pthread_t tid;
-    pthread_attr_t attr;
-    pthread_attr_init(&attr);
-    pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED);
-    int rc = pthread_create(&tid, &attr, client_thread, carg);
-    if (rc != 0) {
-      perror("pthread_create");
-      const char *msg = "Server error: cannot spawn client thread";
-      send_response(confd, 'E', msg, (int)strlen(msg));
-      close(confd);
-      free(carg);
-      thread_occ[slot] = 0;
-      continue;
-    }
-
+    enqueue_client(confd);
   }
 
   close(fd);
